@@ -2,20 +2,21 @@
 // Interface maître SysWatch — tourne sur le PC du professeur
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::ErrorKind;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-const AUTH_TOKEN: &str = "ENSPD2026";
 const PORT: u16 = 7878;
 
 // Liste statique des machines — à remplir avec les IPs des PC étudiants
 // En cours : chaque étudiant communique son IP via `ipconfig`
 fn machines() -> HashMap<String, String> {
     let mut m = HashMap::new();
+    m.insert("localhost".to_string(), "127.0.0.1".to_string());
     // format : "nom_affichage" => "ip"
-    m.insert("PC-01-TSEFACK".to_string(), "192.168.1.101".to_string());
-    m.insert("PC-02-FOKAM".to_string(), "192.168.1.102".to_string());
+    m.insert("PC-01-warren".to_string(), "192.168.0.219".to_string());
+    m.insert("PC-02-anne".to_string(), "192.168.0.154".to_string());
     m.insert("PC-03-NZEUTEM".to_string(), "192.168.1.103".to_string());
     m.insert("ateba".to_string(), "192.168.1.105".to_string());
     // Ajouter autant de lignes que d'étudiants
@@ -38,7 +39,18 @@ impl AgentSession {
             &addr.parse().map_err(|e| format!("{}", e))?,
             Duration::from_secs(2),
         )
-        .map_err(|e| format!("Connexion refusée: {}", e))?;
+        .map_err(|e| match e.kind() {
+            ErrorKind::ConnectionRefused => {
+                format!("connexion refusee: aucun serveur SysWatch n'ecoute sur {}", addr)
+            }
+            ErrorKind::TimedOut => {
+                format!(
+                    "connexion expiree vers {}: IP incorrecte, machine inaccessible, pare-feu actif, ou serveur non lance",
+                    addr
+                )
+            }
+            _ => format!("connexion impossible vers {}: {}", addr, e),
+        })?;
 
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
@@ -49,13 +61,12 @@ impl AgentSession {
             reader: BufReader::new(stream),
         };
 
-        // Authentification
-        session.read_until_prompt("TOKEN: ")?;
-        session.send(AUTH_TOKEN)?;
-        let resp = session.read_line()?;
-        if resp.trim() != "OK" {
-            return Err("Token refusé".to_string());
-        }
+        session.read_until_prompt("> ").map_err(|e| {
+            format!(
+                "connexion etablie avec {} mais aucune invite SysWatch recue: {}",
+                addr, e
+            )
+        })?;
 
         Ok(session)
     }
@@ -66,48 +77,52 @@ impl AgentSession {
             .map_err(|e| e.to_string())
     }
 
-    fn read_line(&mut self) -> Result<String, String> {
-        let mut line = String::new();
-        self.reader
-            .read_line(&mut line)
-            .map_err(|e| e.to_string())?;
-        Ok(line)
-    }
+    fn read_until_prompt(&mut self, prompt: &str) -> Result<String, String> {
+        let mut result = Vec::new();
+        let prompt_bytes = prompt.as_bytes();
 
-    fn read_until_end(&mut self) -> Result<String, String> {
-        let mut result = String::new();
         loop {
-            let mut line = String::new();
-            match self.reader.read_line(&mut line) {
+            let mut byte = [0u8; 1];
+            match self.reader.read(&mut byte) {
                 Ok(0) => break,
                 Ok(_) => {
-                    if line.trim() == "END" {
+                    result.push(byte[0]);
+                    if result.ends_with(prompt_bytes) {
                         break;
                     }
-                    result.push_str(&line);
                 }
-                Err(_) => break,
+                Err(err) => return Err(err.to_string()),
             }
         }
-        Ok(result)
+
+        if result.ends_with(prompt_bytes) {
+            let new_len = result.len().saturating_sub(prompt_bytes.len());
+            result.truncate(new_len);
+        }
+
+        String::from_utf8(result).map_err(|e| e.to_string())
     }
 
-    fn read_until_prompt(&mut self, prompt: &str) -> Result<(), String> {
-        let mut buf = String::new();
-        loop {
-            let mut line = String::new();
-            self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
-            buf.push_str(&line);
-            if buf.contains(prompt) {
-                return Ok(());
-            }
-        }
+    fn read_until_disconnect(&mut self) -> Result<String, String> {
+        let mut result = String::new();
+        self.reader
+            .read_to_string(&mut result)
+            .map_err(|e| e.to_string())?;
+        Ok(result)
     }
 
     fn run_command(&mut self, cmd: &str) -> String {
         match self.send(cmd) {
             Err(e) => format!("Erreur envoi: {}", e),
-            Ok(_) => self.read_until_end().unwrap_or_else(|e| format!("Erreur lecture: {}", e)),
+            Ok(_) => {
+                let response = if cmd.eq_ignore_ascii_case("quit") {
+                    self.read_until_disconnect()
+                } else {
+                    self.read_until_prompt("> ")
+                };
+
+                response.unwrap_or_else(|e| format!("Erreur lecture: {}", e))
+            }
         }
     }
 }
@@ -154,12 +169,7 @@ fn print_menu() {
     println!("║  all <cmd>     — envoyer cmd à toutes        ║");
     println!("╠══════════════════════════════════════════════╣");
     println!("║  Commandes disponibles sur les agents :      ║");
-    println!("║  cpu / mem / ps / all                        ║");
-    println!("║  msg <texte>   — afficher message            ║");
-    println!("║  install <pkg> — installer un logiciel       ║");
-    println!("║  shutdown      — éteindre la machine         ║");
-    println!("║  reboot        — redémarrer                  ║");
-    println!("║  abort         — annuler extinction          ║");
+    println!("║  cpu / mem / ps / all / help / quit         ║");
     println!("╠══════════════════════════════════════════════╣");
     println!("║  help          — afficher ce menu            ║");
     println!("║  quit          — quitter le master           ║");
